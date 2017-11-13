@@ -92,22 +92,29 @@ class Base(object):
     e.g. "sched_switch:") but it can be anything else for trace points
     generated using trace_printk().
 
-    :param parse_raw: If :code:`True`, raw trace data (-R option) to
+    :param parse_raw: If :code:`True`, raw trace data (-r option) to
         trace-cmd will be used
+
+    :param fallback: If :code:`True`, the parsing class will be used
+        only if no other candidate class's unique_word matched. subclasses
+        should override this (for ex. TracingMarkWrite uses it)
 
     This class acts as a base class for all TRAPpy events
 
     """
-    def __init__(self, parse_raw=False):
+    def __init__(self, parse_raw=False, fallback=False):
+        self.fallback = fallback
+        self.tracer = None
         self.data_frame = pd.DataFrame()
+        self.line_array = []
         self.data_array = []
         self.time_array = []
         self.comm_array = []
         self.pid_array = []
         self.tgid_array = []
         self.cpu_array = []
-        self.callback = None
         self.parse_raw = parse_raw
+        self.cached = False
 
     def finalize_object(self):
         pass
@@ -146,7 +153,7 @@ class Base(object):
 
         return ret
 
-    def append_data(self, time, comm, pid, tgid, cpu, data):
+    def append_data(self, time, comm, pid, tgid, cpu, line, data):
         """Append data parsed from a line to the corresponding arrays
 
         The :mod:`DataFrame` will be created from this when the whole trace
@@ -172,15 +179,32 @@ class Base(object):
         self.pid_array.append(pid)
         self.tgid_array.append(tgid)
         self.cpu_array.append(cpu)
+        self.line_array.append(line)
         self.data_array.append(data)
 
-	if not self.callback:
-            return
-        data_dict = self.generate_data_dict(comm, pid, cpu, data)
-        self.callback(time, data_dict)
+    def string_cast(self, string, type):
+        """ Attempt to convert string to another type
 
-    def generate_data_dict(self, comm, pid, tgid, cpu, data_str):
-        data_dict = {"__comm": comm, "__pid": pid, "__tgid": tgid, "__cpu": cpu}
+        Here we attempt to cast string to a type. Currently only
+        integer conversion is supported with future expansion
+        left open to other types.
+
+        :param string: The value to convert.
+        :type string: str
+
+        :param type: The type to convert to.
+        :type type: type
+        """
+        # Currently this function only supports int conversion
+        if type != int:
+            return
+        # Handle false-positives for negative numbers
+        if not string.lstrip("-").isdigit():
+            return string
+        return int(string)
+
+    def generate_data_dict(self, data_str):
+        data_dict = {}
         prev_key = None
         for field in data_str.split():
             if "=" not in field:
@@ -190,10 +214,7 @@ class Base(object):
                 data_dict[prev_key] += ' ' + field
                 continue
             (key, value) = field.split('=', 1)
-            try:
-                value = int(value)
-            except ValueError:
-                pass
+            value = self.string_cast(value, int)
             data_dict[key] = value
             prev_key = key
         return data_dict
@@ -207,10 +228,11 @@ class Base(object):
         check_memory_usage = True
         check_memory_count = 1
 
-        for (comm, pid, tgid, cpu, data_str) in zip(self.comm_array, self.pid_array,
+        for (comm, pid, tgid, cpu, line, data_str) in zip(self.comm_array, self.pid_array,
                                               self.tgid_array, self.cpu_array,
-                                              self.data_array):
-            data_dict = self.generate_data_dict(comm, pid, tgid, cpu, data_str)
+                                              self.line_array, self.data_array):
+            data_dict = {"__comm": comm, "__pid": pid, "__tgid": tgid, "__cpu": cpu, "__line": line}
+            data_dict.update(self.generate_data_dict(data_str))
 
             # When running out of memory, Pandas has been observed to segfault
             # rather than throwing a proper Python error.
@@ -244,6 +266,7 @@ class Base(object):
         self.data_frame = pd.DataFrame(self.generate_parsed_data(), index=time_idx)
 
         self.time_array = []
+        self.line_array = []
         self.comm_array = []
         self.pid_array = []
         self.cpu_array = []
@@ -257,6 +280,14 @@ class Base(object):
         """
         self.data_frame.to_csv(fname)
 
+    def read_csv(self, fname):
+        """Read the csv data into a DataFrame
+
+        :param fname: The name of the CSV file
+        :type fname: str
+        """
+        self.data_frame = pd.read_csv(fname, index_col = 0)
+
     def normalize_time(self, basetime):
         """Substract basetime from the Time of the data frame
 
@@ -264,9 +295,6 @@ class Base(object):
             the time index
         :type basetime: float
         """
-        # HACK: We don't normalize anymore after the fact
-        return
-
         if basetime and not self.data_frame.empty:
             self.data_frame.reset_index(inplace=True)
             self.data_frame["Time"] = self.data_frame["Time"] - basetime

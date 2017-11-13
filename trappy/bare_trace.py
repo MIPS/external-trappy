@@ -27,13 +27,12 @@ class BareTrace(object):
 
     """
 
-    def __init__(self, name="", build_df=True):
+    def __init__(self, name=""):
         self.name = name
         self.normalized_time = False
         self.class_definitions = {}
         self.trace_classes = []
         self.basetime = 0
-        self.build_df = build_df
 
     def get_duration(self):
         """Returns the largest time value of all classes,
@@ -68,14 +67,13 @@ class BareTrace(object):
 
         return filters
 
-    def normalize_time(self, basetime=None):
+    def _normalize_time(self, basetime=None):
         """Normalize the time of all the trace classes
 
         :param basetime: The offset which needs to be subtracted from
             the time index
         :type basetime: float
         """
-        return # HACK: Since we're not normalizing anymore after the fact
 
         if basetime is not None:
             self.basetime = basetime
@@ -135,8 +133,13 @@ class BareTrace(object):
         setattr(self, name, event)
 
     def finalize_objects(self):
-        if not self.build_df:
-            return
         for trace_class in self.trace_classes:
+            # If cached, don't need to do any other DF operation
+            if trace_class.cached:
+                continue
+            trace_class.tracer = self
             trace_class.create_dataframe()
             trace_class.finalize_object()
+
+    def generate_data_dict(self):
+        return None
