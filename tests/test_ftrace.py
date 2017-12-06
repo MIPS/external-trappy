@@ -181,16 +181,14 @@ class TestFTrace(BaseTestThermal):
 
 
     def test_ftrace_normalize_time(self):
-        """FTrace().normalize_time() works accross all classes"""
-
-        return # HACK: Time normalization test no longer valid
+        """FTrace()._normalize_time() works accross all classes"""
 
         trace = trappy.FTrace(normalize_time=False)
 
         prev_inpower_basetime = trace.cpu_in_power.data_frame.index[0]
         prev_inpower_last = trace.cpu_in_power.data_frame.index[-1]
 
-        trace.normalize_time()
+        trace._normalize_time()
 
         self.assertEquals(round(trace.thermal.data_frame.index[0], 7), 0)
 
@@ -231,6 +229,31 @@ class TestFTrace(BaseTestThermal):
 
         # Make sure there are no NaNs in the middle of the array
         self.assertTrue(allfreqs[0][1]["A57_freq_in"].notnull().all())
+
+    def test_apply_callbacks(self):
+        """Test apply_callbacks()"""
+
+        counts = {
+            "cpu_in_power": 0,
+            "cpu_out_power": 0
+        }
+
+        def cpu_in_power_fn(data):
+            counts["cpu_in_power"] += 1
+
+        def cpu_out_power_fn(data):
+            counts["cpu_out_power"] += 1
+
+        fn_map = {
+            "cpu_in_power": cpu_in_power_fn,
+            "cpu_out_power": cpu_out_power_fn
+        }
+        trace = trappy.FTrace()
+
+        trace.apply_callbacks(fn_map)
+
+        self.assertEqual(counts["cpu_in_power"], 134)
+        self.assertEqual(counts["cpu_out_power"], 134)
 
     def test_plot_freq_hists(self):
         """Test that plot_freq_hists() doesn't bomb"""
@@ -354,34 +377,14 @@ class TestFTraceRawDat(utils_tests.SetupDirectory):
         shutil.move("trace.dat", arbitrary_name)
 
         trace = trappy.FTrace(arbitrary_name)
-        self.assertTrue(os.path.isfile("my_trace.raw.txt"))
         self.assertTrue(hasattr(trace, "sched_switch"))
         self.assertTrue(len(trace.sched_switch.data_frame) > 0)
-
-    def test_raw_created_if_dat_and_txt_exist(self):
-        """trace.raw.txt is created when both trace.dat and trace.txt exist"""
-
-        # Create the trace.txt
-        cmd = ["trace-cmd", "report", "trace.dat"]
-        with open(os.devnull) as devnull:
-            out = subprocess.check_output(cmd, stderr=devnull)
-
-        with open("trace.txt", "w") as fout:
-            fout.write(out)
-
-        # Now check that the raw trace is created and analyzed when creating the trace
-        trace = trappy.FTrace()
-
-        self.assertTrue(hasattr(trace, "sched_switch"))
-        self.assertTrue(len(trace.sched_switch.data_frame) > 0)
-        self.assertTrue("prev_comm" in trace.sched_switch.data_frame.columns)
 
 class TestFTraceRawBothTxt(utils_tests.SetupDirectory):
 
     def __init__(self, *args, **kwargs):
         super(TestFTraceRawBothTxt, self).__init__(
-             [("raw_trace.txt", "trace.txt"),
-              ("raw_trace.raw.txt", "trace.raw.txt")],
+             [("raw_trace.txt", "trace.txt"),],
              *args,
              **kwargs)
 
@@ -397,10 +400,8 @@ class TestFTraceRawBothTxt(utils_tests.SetupDirectory):
         """Test raw parsing for txt files arbitrary name"""
 
         arbitrary_name = "my_trace.txt"
-        arbitrary_name_raw = "my_trace.raw.txt"
 
         shutil.move("trace.txt", arbitrary_name)
-        shutil.move("trace.raw.txt", arbitrary_name_raw)
 
         trace = trappy.FTrace(arbitrary_name)
         self.assertTrue(hasattr(trace, "sched_switch"))
@@ -425,6 +426,10 @@ class TestFTraceSched(utils_tests.SetupDirectory):
     def test_ftrace_unique_but_no_fields(self):
         """Test with a matching unique but no special fields"""
         version_parser = trappy.register_dynamic_ftrace("Version", "version")
+
+        # Append invalid line to file
+        with open("trace.txt", "a") as fil:
+            fil.write("version = 6")
 
         with self.assertRaises(ValueError):
             trappy.FTrace(scope="custom")
@@ -473,14 +478,6 @@ class TestTraceDat(utils_tests.SetupDirectory):
 
         self.assert_thermal_in_trace("trace.txt")
 
-    def test_do_raw_txt_if_not_there(self):
-        """Create trace.raw.txt if it's not there"""
-        self.assertFalse(os.path.isfile("trace.raw.txt"))
-
-        trappy.FTrace()
-
-        self.assert_thermal_in_trace("trace.raw.txt")
-
     def test_ftrace_arbitrary_trace_dat(self):
         """FTrace() works if asked to parse a binary trace with a filename other than trace.dat"""
         arbitrary_trace_name = "my_trace.dat"
@@ -489,11 +486,9 @@ class TestTraceDat(utils_tests.SetupDirectory):
         dfr = trappy.FTrace(arbitrary_trace_name).thermal.data_frame
 
         self.assertTrue(os.path.exists("my_trace.txt"))
-        self.assertTrue(os.path.exists("my_trace.raw.txt"))
         self.assertTrue(len(dfr) > 0)
         self.assertFalse(os.path.exists("trace.dat"))
         self.assertFalse(os.path.exists("trace.txt"))
-        self.assertFalse(os.path.exists("trace.raw.txt"))
 
     def test_regenerate_txt_if_outdated(self):
         """Regenerate the trace.txt if it's older than the trace.dat"""

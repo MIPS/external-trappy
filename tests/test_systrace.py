@@ -17,11 +17,14 @@ import utils_tests
 
 import trappy
 
+import numpy as np
+
 class TestSystrace(utils_tests.SetupDirectory):
 
     def __init__(self, *args, **kwargs):
         super(TestSystrace, self).__init__(
-             [("trace_systrace.html", "trace.html")],
+             [("trace_systrace.html", "trace.html"),
+             ("trace_surfaceflinger.html", "trace_sf.html")],
              *args,
              **kwargs)
 
@@ -51,6 +54,44 @@ class TestSystrace(utils_tests.SetupDirectory):
         self.assertTrue(hasattr(trace, "_cpus"))
         self.assertEquals(trace._cpus, 3)
 
+    def test_systrace_userspace(self):
+        """Test parsing of userspace events"""
+
+        # Test a 'B' event (begin)
+        trace = trappy.SysTrace("trace_sf.html")
+        dfr = trace.tracing_mark_write.data_frame
+        self.assertEquals(dfr['__pid'].iloc[2], 7591)
+        self.assertEquals(dfr['__comm'].iloc[2], 'RenderThread')
+        self.assertEquals(dfr['pid'].iloc[2], 7459)
+        self.assertEquals(dfr['event'].iloc[2], 'B')
+        self.assertEquals(dfr['func'].iloc[2], 'notifyFramePending')
+        self.assertEquals(dfr['data'].iloc[2], None)
+
+        # Test a 'C' event (count)
+        self.assertEquals(dfr['__pid'].iloc[-2], 612)
+        self.assertEquals(dfr['__comm'].iloc[-2], 'HwBinder:594_1')
+        self.assertEquals(dfr['pid'].iloc[-2], 594)
+        self.assertEquals(dfr['func'].iloc[-2], 'HW_VSYNC_0')
+        self.assertEquals(dfr['event'].iloc[-2], 'C')
+        self.assertEquals(dfr['data'].iloc[-2], '0')
+
+        # Test an 'E' event (end)
+        edfr = dfr[dfr['event'] == 'E']
+        self.assertEquals(edfr['__pid'].iloc[0], 7591)
+        self.assertEquals(edfr['__comm'].iloc[0], 'RenderThread')
+        self.assertTrue(np.isnan(edfr['pid'].iloc[0]))
+        self.assertEquals(edfr['func'].iloc[0], None)
+        self.assertEquals(edfr['event'].iloc[0], 'E')
+        self.assertEquals(edfr['data'].iloc[0], None)
+
+    def test_systrace_line_num(self):
+        """Test for line numbers in a systrace"""
+        trace = trappy.SysTrace("trace_sf.html")
+        dfr = trace.sched_switch.data_frame
+        self.assertEquals(trace.lines, 2506)
+        self.assertEquals(dfr['__line'].iloc[0], 0)
+        self.assertEquals(dfr['__line'].iloc[1], 6)
+        self.assertEquals(dfr['__line'].iloc[-1], 2505)
 
 class TestLegacySystrace(utils_tests.SetupDirectory):
 

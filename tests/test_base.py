@@ -85,7 +85,7 @@ class TestBase(utils_tests.SetupDirectory):
         in_data = """     kworker/4:1-397   [004]   720.741315: thermal_power_cpu_get: cpus=000000f0 freq=1900000 raw_cpu_power=1259 load={} power=61
      kworker/4:1-397   [004]   720.741349: thermal_power_cpu_get: cpus=0000000f freq=1400000 raw_cpu_power=189 load={} power=14"""
 
-        expected_columns = set(["__comm", "__pid", "__tgid", "__cpu", "cpus", "freq",
+        expected_columns = set(["__comm", "__pid", "__tgid", "__cpu", "__line", "cpus", "freq",
                                 "raw_cpu_power", "power"])
 
         with open("trace.txt", "w") as fout:
@@ -101,6 +101,7 @@ class TestBase(utils_tests.SetupDirectory):
         """TestBase: Task name, PID, CPU and timestamp are properly paresed """
 
         events = {
+                # Trace events using [global] clock format ([us] resolution)
                 1001.456789 : { 'task': 'rcu_preempt',       'pid': 1123, 'cpu': 001 },
                 1002.456789 : { 'task': 'rs:main',           'pid': 2123, 'cpu': 002 },
                 1003.456789 : { 'task': 'AsyncTask #1',      'pid': 3123, 'cpu': 003 },
@@ -108,6 +109,15 @@ class TestBase(utils_tests.SetupDirectory):
                 1005.456789 : { 'task': 'jbd2/sda2-8',       'pid': 5123, 'cpu': 005 },
                 1006.456789 : { 'task': 'IntentService[',    'pid': 6123, 'cpu': 005 },
                 1006.456789 : { 'task': r'/system/bin/.s$_?.u- \a]}c\./ef[.12]*[[l]in]ger',
+                                'pid': 1234, 'cpu': 666 },
+                # Trace events using [boot] clock format ([ns] resolution)
+                1011456789000: { 'task': 'rcu_preempt',       'pid': 1123, 'cpu': 001 },
+                1012456789000: { 'task': 'rs:main',           'pid': 2123, 'cpu': 002 },
+                1013456789000: { 'task': 'AsyncTask #1',      'pid': 3123, 'cpu': 003 },
+                1014456789000: { 'task': 'kworker/1:1H',      'pid': 4123, 'cpu': 004 },
+                1015456789000: { 'task': 'jbd2/sda2-8',       'pid': 5123, 'cpu': 005 },
+                1016456789000: { 'task': 'IntentService[',    'pid': 6123, 'cpu': 005 },
+                1016456789000: { 'task': r'/system/bin/.s$_?.u- \a]}c\./ef[.12]*[[l]in]ger',
                                 'pid': 1234, 'cpu': 666 },
         }
 
@@ -121,7 +131,7 @@ class TestBase(utils_tests.SetupDirectory):
                         timestamp
                         )
 
-        expected_columns = set(["__comm", "__pid", "__tgid", "__cpu", "tag"])
+        expected_columns = set(["__comm", "__pid", "__tgid", "__cpu", "__line", "tag"])
 
         with open("trace.txt", "w") as fout:
             fout.write(in_data)
@@ -133,6 +143,8 @@ class TestBase(utils_tests.SetupDirectory):
         self.assertEquals(set(dfr.columns), expected_columns)
 
         for timestamp, event in events.iteritems():
+            if type(timestamp) == int:
+                timestamp = float(timestamp) / 1e9
             self.assertEquals(dfr["__comm"].loc[timestamp], event['task'])
             self.assertEquals(dfr["__pid"].loc[timestamp],  event['pid'])
             self.assertEquals(dfr["__cpu"].loc[timestamp],  event['cpu'])
@@ -145,7 +157,7 @@ class TestBase(utils_tests.SetupDirectory):
 
         in_data = """     rcu_preempt-7     [000]    73.604532: my_sched_stat_runtime:   comm=Space separated taskname pid=7 runtime=262875 [ns] vruntime=17096359856 [ns]"""
 
-        expected_columns = set(["__comm", "__pid", "__tgid", "__cpu", "comm", "pid", "runtime", "vruntime"])
+        expected_columns = set(["__comm", "__pid", "__tgid", "__cpu", "__line", "comm", "pid", "runtime", "vruntime"])
 
         with open("trace.txt", "w") as fout:
             fout.write(in_data)
@@ -203,13 +215,26 @@ class TestBase(utils_tests.SetupDirectory):
         self.assertEquals(round(thrm.data_frame.index[0], 7), 0)
         self.assertEquals(round(last_time - expected_last_time, 7), 0)
 
+    def test_line_num(self):
+        """TestBase: Test line number functionality"""
+        trace = trappy.FTrace()
+        self.assertEquals(trace.lines, 804)
+
+        df = trace.thermal.data_frame
+        self.assertEquals(df.iloc[0]['__line'], 0);
+        self.assertEquals(df.iloc[-1]['__line'], 792);
+
+        df = trace.thermal_governor.data_frame
+        self.assertEquals(df.iloc[0]['__line'], 11);
+        self.assertEquals(df.iloc[-1]['__line'], 803)
+
     def test_equals_in_field_value(self):
         """TestBase: Can parse events with fields with values containing '='"""
         trace = trappy.FTrace("trace_equals.txt", events=['equals_event'])
 
         df = trace.equals_event.data_frame
         self.assertSetEqual(set(df.columns),
-                            set(["__comm", "__pid", "__tgid", "__cpu", "my_field"]))
+                            set(["__comm", "__pid", "__tgid", "__cpu", "__line", "my_field"]))
         self.assertListEqual(df["my_field"].tolist(),
                              ["foo", "foo=bar", "foo=bar=baz", 1,
                               "1=2", "1=foo", "1foo=2"])

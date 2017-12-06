@@ -60,21 +60,19 @@ class TestBareTrace(unittest.TestCase):
 
     def test_bare_trace_get_duration_normalized(self):
         """BareTrace.get_duration() works if the trace has been normalized"""
-        return # HACK: Test no longer valid
 
         trace = trappy.BareTrace()
         trace.add_parsed_event("pmu_counter", self.dfr[0].copy())
         trace.add_parsed_event("load_event", self.dfr[1].copy())
 
         basetime = self.dfr[0].index[0]
-        trace.normalize_time(basetime)
+        trace._normalize_time(basetime)
 
         expected_duration = self.dfr[1].index[-1] - basetime
         self.assertEquals(trace.get_duration(), expected_duration)
 
     def test_bare_trace_normalize_time_accepts_basetime(self):
         """BareTrace().normalize_time() accepts an arbitrary basetime"""
-        return # HACK: Test no longer valid
 
         trace = trappy.BareTrace()
         trace.add_parsed_event("pmu_counter", self.dfr[0].copy())
@@ -82,7 +80,7 @@ class TestBareTrace(unittest.TestCase):
         prev_first_time = trace.pmu_counter.data_frame.index[0]
         basetime = 3
 
-        trace.normalize_time(basetime)
+        trace._normalize_time(basetime)
 
         self.assertEquals(trace.basetime, basetime)
 

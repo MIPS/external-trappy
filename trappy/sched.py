@@ -104,14 +104,16 @@ class SchedSwitch(Base):
     """Parse sched_switch"""
 
     unique_word = "sched_switch:"
+    parse_raw = True
 
     def __init__(self):
-        super(SchedSwitch, self).__init__(parse_raw=True)
+        super(SchedSwitch, self).__init__(parse_raw=self.parse_raw)
 
-    def append_data(self, time, comm, pid, tgid, cpu, data):
-        data_rep = data.replace(" ==> ", " ")
-        super(SchedSwitch, self).append_data(time, comm, pid, tgid, cpu,
-                                             data_rep)
+    def create_dataframe(self):
+        self.data_array = [line.replace(" ==> ", " ", 1)
+                           for line in self.data_array]
+
+        super(SchedSwitch, self).create_dataframe()
 
 register_ftrace_parser(SchedSwitch, "sched")
 

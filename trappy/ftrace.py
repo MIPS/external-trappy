@@ -18,9 +18,13 @@
 # pylint: disable=no-member
 
 import itertools
+import json
 import os
 import re
 import pandas as pd
+import hashlib
+import shutil
+import warnings
 
 from trappy.bare_trace import BareTrace
 from trappy.utils import listify
@@ -46,6 +50,12 @@ def _plot_freq_hists(allfreqs, what, axis, title):
         trappy.plot_utils.plot_hist(allfreqs[actor], ax, this_title, "KHz", 20,
                              "Frequency", xlim, "default")
 
+SPECIAL_FIELDS_RE = re.compile(
+                        r"^\s*(?P<comm>.*)-(?P<pid>\d+)\s+\(?(?P<tgid>.*?)?\)"\
+                        r"?\s*\[(?P<cpu>\d+)\](?:\s+....)?\s+"\
+                        r"(?P<timestamp>[0-9]+(?P<us>\.[0-9]+)?): (\w+:\s+)+(?P<data>.+)"
+)
+
 class GenericFTrace(BareTrace):
     """Generic class to parse output of FTrace.  This class is meant to be
 subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
@@ -56,15 +66,70 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
 
     dynamic_classes = {}
 
+    disable_cache = False
+
+    def _trace_cache_path(self):
+        trace_file = self.trace_path
+        cache_dir  = '.' +  os.path.basename(trace_file) + '.cache'
+        tracefile_dir = os.path.dirname(os.path.abspath(trace_file))
+        cache_path = os.path.join(tracefile_dir, cache_dir)
+        return cache_path
+
+    def _check_trace_cache(self, params):
+        cache_path = self._trace_cache_path()
+        md5file = os.path.join(cache_path, 'md5sum')
+        basetime_path = os.path.join(cache_path, 'basetime')
+        params_path = os.path.join(cache_path, 'params.json')
+
+        for path in [cache_path, md5file, params_path]:
+            if not os.path.exists(path):
+                return False
+
+        with open(md5file) as f:
+            cache_md5sum = f.read()
+        with open(basetime_path) as f:
+            self.basetime = float(f.read())
+        with open(self.trace_path, 'rb') as f:
+            trace_md5sum = hashlib.md5(f.read()).hexdigest()
+        with open(params_path) as f:
+            cache_params = json.dumps(json.load(f))
+
+        # Convert to a json string for comparison
+        params = json.dumps(params)
+
+        # check if cache is valid
+        if cache_md5sum != trace_md5sum or cache_params != params:
+            shutil.rmtree(cache_path)
+            return False
+        return True
+
+    def _create_trace_cache(self, params):
+        cache_path = self._trace_cache_path()
+        md5file = os.path.join(cache_path, 'md5sum')
+        basetime_path = os.path.join(cache_path, 'basetime')
+        params_path = os.path.join(cache_path, 'params.json')
+
+        if os.path.exists(cache_path):
+            shutil.rmtree(cache_path)
+        os.mkdir(cache_path)
+
+        md5sum = hashlib.md5(open(self.trace_path, 'rb').read()).hexdigest()
+        with open(md5file, 'w') as f:
+            f.write(md5sum)
+
+        with open(basetime_path, 'w') as f:
+            f.write(str(self.basetime))
+
+        with open(params_path, 'w') as f:
+            json.dump(params, f)
+
+    def _get_csv_path(self, trace_class):
+        path = self._trace_cache_path()
+        return os.path.join(path, trace_class.__class__.__name__ + '.csv')
+
     def __init__(self, name="", normalize_time=True, scope="all",
-                 events=[], event_callbacks={}, window=(0, None),
-                 abs_window=(0, None), build_df=True):
-        super(GenericFTrace, self).__init__(name, build_df)
-
-        self.normalized_time = normalize_time
-
-        if not hasattr(self, "needs_raw_parsing"):
-            self.needs_raw_parsing = False
+                 events=[], window=(0, None), abs_window=(0, None)):
+        super(GenericFTrace, self).__init__(name)
 
         self.class_definitions.update(self.dynamic_classes.items())
         self.__add_events(listify(events))
@@ -79,16 +144,13 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
 
         for attr, class_def in self.class_definitions.iteritems():
             trace_class = class_def()
-            if event_callbacks.has_key(attr):
-                trace_class.callback = event_callbacks[attr]
             setattr(self, attr, trace_class)
             self.trace_classes.append(trace_class)
 
-        self.__parse_trace_file(self.trace_path, window, abs_window)
-        if self.needs_raw_parsing and (self.trace_path_raw is not None):
-            self.__parse_trace_file(self.trace_path_raw, window, abs_window,
-                                    raw=True)
-        self.finalize_objects()
+        # save parameters to complete init later
+        self.normalize_time = normalize_time
+        self.window = window
+        self.abs_window = abs_window
 
     @classmethod
     def register_parser(cls, cobject, scope):
@@ -129,6 +191,47 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             if cobject == obj:
                 del scope_classes[name]
 
+    def _do_parse(self):
+        params = {'window': self.window, 'abs_window': self.abs_window}
+        if not self.__class__.disable_cache and self._check_trace_cache(params):
+            # Read csv into frames
+            for trace_class in self.trace_classes:
+                try:
+                    csv_file = self._get_csv_path(trace_class)
+                    trace_class.read_csv(csv_file)
+                    trace_class.cached = True
+                except:
+                    warnstr = "TRAPpy: Couldn't read {} from cache, reading it from trace".format(trace_class)
+                    warnings.warn(warnstr)
+
+        if all([c.cached for c in self.trace_classes]):
+            if self.normalize_time:
+                self._normalize_time()
+            return
+
+        self.__parse_trace_file(self.trace_path)
+
+        self.finalize_objects()
+
+        if not self.__class__.disable_cache:
+            try:
+                # Recreate basic cache directories only if nothing cached
+                if not any([c.cached for c in self.trace_classes]):
+                    self._create_trace_cache(params)
+
+                # Write out only events that weren't cached before
+                for trace_class in self.trace_classes:
+                    if trace_class.cached:
+                        continue
+                    csv_file = self._get_csv_path(trace_class)
+                    trace_class.write_csv(csv_file)
+            except OSError as err:
+                warnings.warn(
+                    "TRAPpy: Cache not created due to OS error: {0}".format(err))
+
+        if self.normalize_time:
+            self._normalize_time()
+
     def __add_events(self, events):
         """Add events to the class_definitions
 
@@ -161,73 +264,66 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                 trace_class = DynamicTypeFactory(event_name, (Base,), kwords)
                 self.class_definitions[event_name] = trace_class
 
-    def __populate_data(self, fin, cls_for_unique_word, window, abs_window):
+    def __get_trace_class(self, line, cls_word):
+        trace_class = None
+        for unique_word, cls in cls_word.iteritems():
+            if unique_word in line:
+                trace_class = cls
+                if not cls.fallback:
+                    return trace_class
+        return trace_class
+
+    def __populate_data(self, fin, cls_for_unique_word):
         """Append to trace data from a txt trace"""
-
-        def contains_unique_word(line, unique_words=cls_for_unique_word.keys()):
-            for unique_word in unique_words:
-                if unique_word in line:
-                    return True
-            return False
-
-        special_fields_regexp = r"^\s*(?P<comm>.*)-(?P<pid>\d+)\s+\(?(?P<tgid>.*?)?\)"\
-                                r"?\s*\[(?P<cpu>\d+)\](?:\s+....)?\s+(?P<timestamp>[0-9]+\.[0-9]+):"
-        special_fields_regexp = re.compile(special_fields_regexp)
-        start_match = re.compile(r"[A-Za-z0-9_]+=")
 
         actual_trace = itertools.dropwhile(self.trace_hasnt_started(), fin)
         actual_trace = itertools.takewhile(self.trace_hasnt_finished(),
                                            actual_trace)
 
-        for line in itertools.ifilter(contains_unique_word, actual_trace):
-            for unique_word, cls in cls_for_unique_word.iteritems():
-                if unique_word in line:
-                    trace_class = cls
-                    break
-            else:
-                raise FTraceParseError("No unique word in '{}'".format(line))
+        for line in actual_trace:
+            trace_class = self.__get_trace_class(line, cls_for_unique_word)
+            if not trace_class:
+                self.lines += 1
+                continue
 
             line = line[:-1]
 
-            special_fields_match = special_fields_regexp.match(line)
-            if not special_fields_match:
-                raise FTraceParseError("Couldn't match special fields in '{}'".format(line))
-            comm = special_fields_match.group('comm')
-            pid = int(special_fields_match.group('pid'))
-            cpu = int(special_fields_match.group('cpu'))
-            tgid = special_fields_match.group('tgid')
-            if not tgid or tgid[0] == '-':
-                tgid = -1
-            else:
-                tgid = int(tgid)
+            fields_match = SPECIAL_FIELDS_RE.match(line)
+            if not fields_match:
+                raise FTraceParseError("Couldn't match fields in '{}'".format(line))
+            comm = fields_match.group('comm')
+            pid = int(fields_match.group('pid'))
+            cpu = int(fields_match.group('cpu'))
+            tgid = fields_match.group('tgid')
+            tgid = -1 if (not tgid or '-' in tgid) else int(tgid)
 
-            timestamp = float(special_fields_match.group('timestamp'))
+            # The timestamp, depending on the trace_clock configuration, can be
+            # reported either in [s].[us] or [ns] format. Let's ensure that we
+            # always generate DF which have the index expressed in:
+            #    [s].[decimals]
+            timestamp = float(fields_match.group('timestamp'))
+            if not fields_match.group('us'):
+                timestamp /= 1e9
+            data_str = fields_match.group('data')
 
             if not self.basetime:
                 self.basetime = timestamp
 
-            if (timestamp < window[0] + self.basetime) or \
-               (timestamp < abs_window[0]):
+            if (timestamp < self.window[0] + self.basetime) or \
+               (timestamp < self.abs_window[0]):
+                self.lines += 1
                 continue
 
-            if (window[1] and timestamp > window[1] + self.basetime) or \
-               (abs_window[1] and timestamp > abs_window[1]):
+            if (self.window[1] and timestamp > self.window[1] + self.basetime) or \
+               (self.abs_window[1] and timestamp > self.abs_window[1]):
                 return
 
-            try:
-                data_start_idx =  start_match.search(line).start()
-            except AttributeError:
-                continue
-
-            if self.normalized_time:
-                timestamp = timestamp - self.basetime
-
-            data_str = line[data_start_idx:]
-
             # Remove empty arrays from the trace
-            data_str = re.sub(r"[A-Za-z0-9_]+=\{\} ", r"", data_str)
+            if "={}" in data_str:
+                data_str = re.sub(r"[A-Za-z0-9_]+=\{\} ", r"", data_str)
 
-            trace_class.append_data(timestamp, comm, pid, tgid, cpu, data_str)
+            trace_class.append_data(timestamp, comm, pid, tgid, cpu, self.lines, data_str)
+            self.lines += 1
 
     def trace_hasnt_started(self):
         """Return a function that accepts a line and returns true if this line
@@ -241,7 +337,7 @@ is not part of the trace.
         started).
 
         """
-        return lambda x: False
+        return lambda line: not SPECIAL_FIELDS_RE.match(line)
 
     def trace_hasnt_finished(self):
         """Return a function that accepts a line and returns true if this line
@@ -260,15 +356,14 @@ is part of the trace.
         """
         return lambda x: True
 
-    def __parse_trace_file(self, trace_file, window, abs_window, raw=False):
+    def __parse_trace_file(self, trace_file):
         """parse the trace and create a pandas DataFrame"""
 
         # Memoize the unique words to speed up parsing the trace file
         cls_for_unique_word = {}
         for trace_name in self.class_definitions.iterkeys():
             trace_class = getattr(self, trace_name)
-
-            if self.needs_raw_parsing and (trace_class.parse_raw != raw):
+            if trace_class.cached:
                 continue
 
             unique_word = trace_class.unique_word
@@ -279,8 +374,9 @@ is part of the trace.
 
         try:
             with open(trace_file) as fin:
+                self.lines = 0
                 self.__populate_data(
-                    fin, cls_for_unique_word, window, abs_window)
+                    fin, cls_for_unique_word)
         except FTraceParseError as e:
             raise ValueError('Failed to parse ftrace file {}:\n{}'.format(
                 trace_file, str(e)))
@@ -318,6 +414,60 @@ is part of the trace.
             ret.append(("GPU", dfr))
 
         return ret
+
+    def apply_callbacks(self, fn_map, *kwarg):
+        """
+        Apply callback functions to trace events in chronological order.
+
+        This method iterates over a user-specified subset of the available trace
+        event dataframes, calling different user-specified functions for each
+        event type. These functions are passed a dictionary mapping 'Index' and
+        the column names to their values for that row.
+
+        For example, to iterate over trace t, applying your functions callback_fn1
+        and callback_fn2 to each sched_switch and sched_wakeup event respectively:
+
+        t.apply_callbacks({
+            "sched_switch": callback_fn1,
+            "sched_wakeup": callback_fn2
+        })
+        """
+        dfs = {event: getattr(self, event).data_frame for event in fn_map.keys()}
+        events = [event for event in fn_map.keys() if not dfs[event].empty]
+        iters = {event: dfs[event].itertuples() for event in events}
+        next_rows = {event: iterator.next() for event,iterator in iters.iteritems()}
+
+        # Column names beginning with underscore will not be preserved in tuples
+        # due to constraints on namedtuple field names, so store mappings from
+        # column name to column number for each trace event.
+        col_idxs = {event: {
+            name: idx for idx, name in enumerate(
+                ['Index'] + dfs[event].columns.tolist()
+            )
+        } for event in events}
+
+        def getLine(event):
+            line_col_idx = col_idxs[event]['__line']
+            return next_rows[event][line_col_idx]
+
+        while events:
+            event_name = min(events, key=getLine)
+            event_tuple = next_rows[event_name]
+
+            event_dict = {
+                col: event_tuple[idx] for col, idx in col_idxs[event_name].iteritems()
+            }
+
+            if kwarg:
+                fn_map[event_name](event_dict, kwarg)
+            else:
+                fn_map[event_name](event_dict)
+
+            event_row = next(iters[event_name], None)
+            if event_row:
+                next_rows[event_name] = event_row
+            else:
+                events.remove(event_name)
 
     def plot_freq_hists(self, map_label, ax):
         """Plot histograms for each actor input and output frequency
@@ -500,16 +650,26 @@ class FTrace(GenericFTrace):
     """
 
     def __init__(self, path=".", name="", normalize_time=True, scope="all",
-                 events=[], event_callbacks={}, window=(0, None),
-                 abs_window=(0, None), build_df=True):
-        self.trace_path, self.trace_path_raw = self.__process_path(path)
-        self.needs_raw_parsing = True
-
-        self.__populate_metadata()
-
+                 events=[], window=(0, None), abs_window=(0, None)):
         super(FTrace, self).__init__(name, normalize_time, scope, events,
-                                     event_callbacks, window, abs_window,
-                                     build_df)
+                                     window, abs_window)
+        self.raw_events = []
+        self.trace_path = self.__process_path(path)
+        self.__populate_metadata()
+        self._do_parse()
+
+    def __warn_about_txt_trace_files(self, trace_dat, raw_txt, formatted_txt):
+        self.__get_raw_event_list()
+        warn_text = ( "You appear to be parsing both raw and formatted "
+                      "trace files. TRAPpy now uses a unified format. "
+                      "If you have the {} file, remove the .txt files "
+                      "and try again. If not, you can manually move "
+                      "lines with the following events from {} to {} :"
+                      ).format(trace_dat, raw_txt, formatted_txt)
+        for raw_event in self.raw_events:
+            warn_text = warn_text+" \"{}\"".format(raw_event)
+
+        raise RuntimeError(warn_text)
 
     def __process_path(self, basepath):
         """Process the path and return the path to the trace text file"""
@@ -520,32 +680,42 @@ class FTrace(GenericFTrace):
             trace_name = os.path.join(basepath, "trace")
 
         trace_txt = trace_name + ".txt"
-        trace_raw = trace_name + ".raw.txt"
+        trace_raw_txt = trace_name + ".raw.txt"
         trace_dat = trace_name + ".dat"
 
         if os.path.isfile(trace_dat):
-            # Both TXT and RAW traces must always be generated
-            if not os.path.isfile(trace_txt) or \
-               not os.path.isfile(trace_raw):
+            # Warn users if raw.txt files are present
+            if os.path.isfile(trace_raw_txt):
+                self.__warn_about_txt_trace_files(trace_dat, trace_raw_txt, trace_txt)
+            # TXT traces must always be generated
+            if not os.path.isfile(trace_txt):
                 self.__run_trace_cmd_report(trace_dat)
-            # TXT (and RAW) traces must match the most recent binary trace
+            # TXT traces must match the most recent binary trace
             elif os.path.getmtime(trace_txt) < os.path.getmtime(trace_dat):
                 self.__run_trace_cmd_report(trace_dat)
 
-        if not os.path.isfile(trace_raw):
-            trace_raw = None
+        return trace_txt
 
-        return trace_txt, trace_raw
+    def __get_raw_event_list(self):
+        self.raw_events = []
+        # Generate list of events which need to be parsed in raw format
+        for event_class in (self.thermal_classes, self.sched_classes, self.dynamic_classes):
+            for trace_class in event_class.itervalues():
+                raw = getattr(trace_class, 'parse_raw', None)
+                if raw:
+                    name = getattr(trace_class, 'name', None)
+                    if name:
+                        self.raw_events.append(name)
 
     def __run_trace_cmd_report(self, fname):
-        """Run "trace-cmd report fname > fname.txt"
-           and "trace-cmd report -R fname > fname.raw.txt"
+        """Run "trace-cmd report [ -r raw_event ]* fname > fname.txt"
 
-        The resulting traces are stored in files with extension ".txt"
-        and ".raw.txt" respectively.  If fname is "my_trace.dat", the
-        trace is stored in "my_trace.txt" and "my_trace.raw.txt".  The
-        contents of the destination files are overwritten if they
-        exist.
+        The resulting trace is stored in files with extension ".txt". If
+        fname is "my_trace.dat", the trace is stored in "my_trace.txt". The
+        contents of the destination file is overwritten if it exists.
+        Trace events which require unformatted output (raw_event == True)
+        are added to the command line with one '-r <event>' each event and
+        trace-cmd then prints those events without formatting.
 
         """
         from subprocess import check_output
@@ -555,8 +725,12 @@ class FTrace(GenericFTrace):
         if not os.path.isfile(fname):
             raise IOError("No such file or directory: {}".format(fname))
 
-        raw_trace_output = os.path.splitext(fname)[0] + ".raw.txt"
         trace_output = os.path.splitext(fname)[0] + ".txt"
+        # Ask for the raw event list and request them unformatted
+        self.__get_raw_event_list()
+        for raw_event in self.raw_events:
+            cmd.extend([ '-r', raw_event ])
+
         cmd.append(fname)
 
         with open(os.devnull) as devnull:
@@ -567,17 +741,9 @@ class FTrace(GenericFTrace):
                     raise OSError(2, "trace-cmd not found in PATH, is it installed?")
                 else:
                     raise
-
-            # Add the -R flag to the trace-cmd
-            # for raw parsing
-            cmd.insert(-1, "-R")
-            raw_out = check_output(cmd, stderr=devnull)
-
         with open(trace_output, "w") as fout:
             fout.write(out)
 
-        with open(raw_trace_output, "w") as fout:
-            fout.write(raw_out)
 
     def __populate_metadata(self):
         """Populates trace metadata"""
@@ -600,6 +766,6 @@ class FTrace(GenericFTrace):
                     setattr(self, "_" + match.group(1), match.group(2))
                     metadata_keys.remove(match.group(1))
 
-                if re.search(r"^\s+[^\[]+-\d+\s+\[\d+\]\s+\d+\.\d+:", line):
+                if SPECIAL_FIELDS_RE.match(line):
                     # Reached a valid trace line, abort metadata population
                     return
